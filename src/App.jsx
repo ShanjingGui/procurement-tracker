@@ -56,6 +56,54 @@ const fmtDateFull = (d) => d ? new Date(d).toISOString().slice(0, 10) : "";
 const daysBetween = (a, b) => (!a || !b) ? null : Math.round((new Date(b) - new Date(a)) / 86400000);
 const isImage = (t) => t && t.startsWith("image/");
 const fmtSize = (b) => { if (!b) return ""; if (b < 1024) return b + "B"; if (b < 1048576) return (b / 1024).toFixed(1) + "KB"; return (b / 1048576).toFixed(1) + "MB"; };
+const PACKAGE_ORDER_KEY = "procurement-tracker:package-order";
+
+function moveItem(list, fromId, toId) {
+  if (fromId === toId) return list;
+  const fromIndex = list.findIndex((item) => item.id === fromId);
+  const toIndex = list.findIndex((item) => item.id === toId);
+  if (fromIndex === -1 || toIndex === -1) return list;
+  const next = [...list];
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  return next;
+}
+
+function withSortOrder(list) {
+  return list.map((item, index) => ({ ...item, sortOrder: index + 1 }));
+}
+
+function readPackageOrder() {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PACKAGE_ORDER_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePackageOrder(packages) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(PACKAGE_ORDER_KEY, JSON.stringify(packages.map((pkg) => pkg.id)));
+}
+
+function sortPackages(packages) {
+  const savedOrder = readPackageOrder();
+  const savedIndex = new Map(savedOrder.map((id, index) => [id, index]));
+  return [...packages].sort((a, b) => {
+    const aSaved = savedIndex.has(a.id);
+    const bSaved = savedIndex.has(b.id);
+    if (aSaved && bSaved) return savedIndex.get(a.id) - savedIndex.get(b.id);
+    if (aSaved) return -1;
+    if (bSaved) return 1;
+    const aSort = Number.isFinite(a.sortOrder) ? a.sortOrder : Number.MAX_SAFE_INTEGER;
+    const bSort = Number.isFinite(b.sortOrder) ? b.sortOrder : Number.MAX_SAFE_INTEGER;
+    if (aSort !== bSort) return aSort - bSort;
+    return (b.createdAt || "").localeCompare(a.createdAt || "");
+  });
+}
 
 const SUPABASE_URL = "https://zfaeenvtjfzywvgpiqqb.supabase.co";
 
@@ -81,7 +129,8 @@ const db = {
 
     const packages = pkgs.map((p) => ({
       id: p.id, packageNo: p.package_no, name: p.name, project: p.project,
-      type: p.type, startDate: p.start_date, flowTemplate: p.flow_template || "full",
+      type: p.type, startDate: p.start_date, flowTemplate: p.flow_template || "full", sortOrder: p.sort_order,
+      createdAt: p.created_at,
       nodes: nodes.filter((n) => n.package_id === p.id).map((n) => ({
         id: n.node_id, name: n.name, nameCN: n.name_cn, refDays: n.ref_days, status: n.status,
         plannedStart: n.planned_start, plannedEnd: n.planned_end, actualStart: n.actual_start,
@@ -99,7 +148,7 @@ const db = {
   },
 
   async createPackage(pkg) {
-    const { error: e1 } = await supabase.from("packages").insert({ id: pkg.id, package_no: pkg.packageNo, name: pkg.name, project: pkg.project, type: pkg.type, start_date: pkg.startDate, flow_template: pkg.flowTemplate });
+    const { error: e1 } = await supabase.from("packages").insert({ id: pkg.id, package_no: pkg.packageNo, name: pkg.name, project: pkg.project, type: pkg.type, start_date: pkg.startDate, flow_template: pkg.flowTemplate, sort_order: pkg.sortOrder || 0 });
     if (e1) { console.error(e1); return false; }
     const rows = pkg.nodes.map((n) => ({ package_id: pkg.id, node_id: n.id, name: n.name, name_cn: n.nameCN, ref_days: n.refDays, status: n.status, planned_start: n.plannedStart, planned_end: n.plannedEnd, actual_start: n.actualStart, actual_end: n.actualEnd, sort_order: n.sortOrder, is_custom: n.isCustom }));
     const { error: e2 } = await supabase.from("nodes").insert(rows);
@@ -120,6 +169,14 @@ const db = {
     return !error;
   },
   async removeNode(pkgId, nodeId) { const { error } = await supabase.from("nodes").delete().eq("package_id", pkgId).eq("node_id", nodeId); return !error; },
+  async reorderNodes(pkgId, nodes) {
+    const results = await Promise.all(nodes.map((node, index) => supabase.from("nodes").update({ sort_order: index + 1 }).eq("package_id", pkgId).eq("node_id", node.id)));
+    return results.every(({ error }) => !error);
+  },
+  async reorderPackages(packages) {
+    const results = await Promise.all(packages.map((pkg, index) => supabase.from("packages").update({ sort_order: index + 1 }).eq("id", pkg.id)));
+    return results.every(({ error }) => !error);
+  },
   async addLog(log) { const { error } = await supabase.from("logs").insert({ id: log.id, package_id: log.packageId, node_id: log.nodeId, type: log.type, content: log.content, timestamp: log.timestamp }); return !error; },
   async deleteLog(logId) { const { error } = await supabase.from("logs").delete().eq("id", logId); return !error; },
 
@@ -166,6 +223,12 @@ body{background:var(--bg);color:var(--text);font-family:${sans};-webkit-font-smo
 .main{flex:1;padding:20px 24px;max-width:1400px;margin:0 auto;width:100%}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:14px}
 .card{background:var(--bg-white);border:1px solid var(--border);border-radius:var(--radius-lg);padding:18px 20px;cursor:pointer;transition:all 0.2s;box-shadow:var(--shadow-sm)}.card:hover{border-color:var(--accent);box-shadow:var(--shadow-md);transform:translateY(-1px)}
+.card.dragging,.tl-row.dragging{opacity:0.45;transform:none;box-shadow:none}
+.drag-handle{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:none;background:transparent;color:var(--text-muted);cursor:grab;border-radius:6px;flex-shrink:0;transition:all 0.15s}
+.drag-handle:hover{background:var(--bg-hover);color:var(--accent)}
+.drag-handle:active{cursor:grabbing}
+.drag-handle::before{content:"⋮⋮";font-size:12px;letter-spacing:1px;line-height:1}
+.card-top{display:flex;align-items:flex-start;gap:10px}
 .card-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px}
 .card-id{font-family:${mono};font-size:12px;color:var(--accent);font-weight:600}.card-name{font-size:14px;font-weight:600;margin-top:2px;color:var(--text);line-height:1.35}
 .card-type{font-size:10px;padding:3px 8px;border-radius:20px;background:var(--bg-surface);color:var(--text-secondary);font-family:${mono};text-transform:uppercase;letter-spacing:0.04em;font-weight:500}
@@ -184,6 +247,7 @@ body{background:var(--bg);color:var(--text);font-family:${sans};-webkit-font-smo
 .tl-header h3{font-size:13px;font-weight:600;display:flex;align-items:center;gap:6px}.tl-header .range{font-size:11px;color:var(--text-muted);font-family:${mono}}
 .tl-row{display:grid;grid-template-columns:190px 1fr;border-bottom:1px solid var(--border);min-height:52px;transition:background 0.1s}.tl-row:last-child{border-bottom:none}.tl-row:hover{background:var(--bg-hover)}
 .tl-label{padding:8px 14px;display:flex;flex-direction:column;justify-content:center;border-right:1px solid var(--border)}
+.tl-label-top{display:flex;align-items:center;gap:4px}
 .tl-label-id{font-family:${mono};font-size:11px;color:var(--accent);font-weight:600}.tl-label-name{font-size:11px;color:var(--text-secondary);margin-top:1px}
 .tl-label-custom{font-size:9px;color:var(--amber);font-family:${mono};font-weight:500}
 .tl-content{display:flex;flex-direction:column}
@@ -259,21 +323,81 @@ export default function App() {
   const [addNodeModal, setAddNodeModal] = useState(false);
   const [logFilter, setLogFilter] = useState("all");
   const [previewImg, setPreviewImg] = useState(null);
+  const [draggingPkgId, setDraggingPkgId] = useState(null);
+  const [draggingNodeId, setDraggingNodeId] = useState(null);
 
-  const reload = useCallback(async () => { const r = await db.loadAll(); if (r) setData(r); setLoading(false); }, []);
+  const reload = useCallback(async () => {
+    const r = await db.loadAll();
+    if (r) {
+      const packages = sortPackages(r.packages).map((pkg) => ({ ...pkg, nodes: withSortOrder(pkg.nodes) }));
+      writePackageOrder(packages);
+      setData({ ...r, packages });
+    }
+    setLoading(false);
+  }, []);
   useEffect(() => { reload(); }, [reload]);
 
   const openPkg = (id) => { setSelPkg(id); setView("detail"); };
   const goBack = () => { setView("dashboard"); setSelPkg(null); };
   const wrap = async (fn) => { setSyncing(true); await fn(); setSyncing(false); };
 
-  const addPkg = async (p) => { setData((d) => ({ ...d, packages: [p, ...d.packages] })); setModal(false); await wrap(() => db.createPackage(p)); };
-  const delPkg = async (id) => { setData((d) => ({ packages: d.packages.filter((p) => p.id !== id), logs: d.logs.filter((l) => l.packageId !== id), attachments: d.attachments.filter((a) => a.packageId !== id) })); goBack(); await wrap(() => db.deletePackage(id)); };
+  const addPkg = async (p) => {
+    setData((d) => {
+      const packages = [{ ...p, sortOrder: 1 }, ...d.packages.map((pkg, index) => ({ ...pkg, sortOrder: index + 2 }))];
+      writePackageOrder(packages);
+      return { ...d, packages };
+    });
+    setModal(false);
+    await wrap(() => db.createPackage(p));
+  };
+  const delPkg = async (id) => {
+    setData((d) => {
+      const packages = withSortOrder(d.packages.filter((p) => p.id !== id));
+      writePackageOrder(packages);
+      return { packages, logs: d.logs.filter((l) => l.packageId !== id), attachments: d.attachments.filter((a) => a.packageId !== id) };
+    });
+    goBack();
+    await wrap(() => db.deletePackage(id));
+  };
   const updNode = async (pkgId, nId, u) => { setData((d) => ({ ...d, packages: d.packages.map((p) => p.id === pkgId ? { ...p, nodes: p.nodes.map((n) => n.id === nId ? { ...n, ...u } : n) } : p) })); await wrap(() => db.updateNode(pkgId, nId, u)); };
-  const addNodeToPkg = async (pkgId, node) => { setData((d) => ({ ...d, packages: d.packages.map((p) => p.id === pkgId ? { ...p, nodes: [...p.nodes, node] } : p) })); setAddNodeModal(false); await wrap(() => db.addNode(pkgId, node)); };
-  const removeNodeFromPkg = async (pkgId, nodeId) => { setData((d) => ({ ...d, packages: d.packages.map((p) => p.id === pkgId ? { ...p, nodes: p.nodes.filter((n) => n.id !== nodeId) } : p) })); await wrap(() => db.removeNode(pkgId, nodeId)); };
+  const addNodeToPkg = async (pkgId, node) => {
+    setData((d) => ({ ...d, packages: d.packages.map((p) => p.id === pkgId ? { ...p, nodes: withSortOrder([...p.nodes, node]) } : p) }));
+    setAddNodeModal(false);
+    await wrap(() => db.addNode(pkgId, node));
+  };
+  const removeNodeFromPkg = async (pkgId, nodeId) => {
+    const nextNodes = data.packages.find((p) => p.id === pkgId)?.nodes.filter((n) => n.id !== nodeId) || [];
+    setData((d) => ({ ...d, packages: d.packages.map((p) => p.id === pkgId ? { ...p, nodes: withSortOrder(p.nodes.filter((n) => n.id !== nodeId)) } : p) }));
+    await wrap(async () => {
+      await db.removeNode(pkgId, nodeId);
+      if (nextNodes.length) await db.reorderNodes(pkgId, nextNodes);
+    });
+  };
   const addLog = async (l) => { setData((d) => ({ ...d, logs: [l, ...d.logs] })); await wrap(() => db.addLog(l)); };
   const delLog = async (id) => { setData((d) => ({ ...d, logs: d.logs.filter((l) => l.id !== id) })); await wrap(() => db.deleteLog(id)); };
+  const reorderPackages = async (fromId, toId) => {
+    if (!fromId || !toId || fromId === toId) return;
+    let nextPackages = [];
+    setData((d) => {
+      nextPackages = withSortOrder(moveItem(d.packages, fromId, toId));
+      writePackageOrder(nextPackages);
+      return { ...d, packages: nextPackages };
+    });
+    await wrap(() => db.reorderPackages(nextPackages));
+  };
+  const reorderNodes = async (pkgId, fromId, toId) => {
+    if (!fromId || !toId || fromId === toId) return;
+    let nextNodes = [];
+    setData((d) => ({
+      ...d,
+      packages: d.packages.map((p) => {
+        if (p.id !== pkgId) return p;
+        nextNodes = withSortOrder(moveItem(p.nodes, fromId, toId));
+        return { ...p, nodes: nextNodes };
+      }),
+    }));
+    await wrap(() => db.reorderNodes(pkgId, nextNodes));
+  };
 
   const uploadAtt = async (file, packageId, nodeId, logId, note) => {
     setSyncing(true);
@@ -300,11 +424,11 @@ export default function App() {
         </div>
       </div>
       <div className="main">
-        {view === "dashboard" ? <Dashboard pkgs={data.packages} logs={data.logs} onOpen={openPkg} />
+        {view === "dashboard" ? <Dashboard pkgs={data.packages} logs={data.logs} onOpen={openPkg} draggingPkgId={draggingPkgId} onDragStart={setDraggingPkgId} onDragEnd={() => setDraggingPkgId(null)} onReorder={reorderPackages} />
         : pkg ? <Detail pkg={pkg} logs={data.logs.filter((l) => l.packageId === pkg.id)} attachments={data.attachments.filter((a) => a.packageId === pkg.id)}
             logFilter={logFilter} setLogFilter={setLogFilter} onBack={goBack} onUpdNode={(nId, u) => updNode(pkg.id, nId, u)} onAddLog={addLog} onDelLog={delLog}
             onDelPkg={() => delPkg(pkg.id)} onShowAddNode={() => setAddNodeModal(true)} onRemoveNode={(nId) => removeNodeFromPkg(pkg.id, nId)}
-            onUploadAtt={uploadAtt} onDelAtt={delAtt} onPreview={setPreviewImg} /> : null}
+            onUploadAtt={uploadAtt} onDelAtt={delAtt} onPreview={setPreviewImg} draggingNodeId={draggingNodeId} onNodeDragStart={setDraggingNodeId} onNodeDragEnd={() => setDraggingNodeId(null)} onReorderNodes={reorderNodes} /> : null}
       </div>
       {modal && <CreateModal onClose={() => setModal(false)} onCreate={addPkg} />}
       {addNodeModal && pkg && <AddNodeModal pkg={pkg} onClose={() => setAddNodeModal(false)} onAdd={(node) => addNodeToPkg(pkg.id, node)} />}
@@ -353,12 +477,12 @@ function AttachmentSection({ attachments, packageId, nodeId, logId, onUpload, on
 }
 
 // ─── Dashboard ───
-function Dashboard({ pkgs, logs, onOpen }) {
+function Dashboard({ pkgs, logs, onOpen, draggingPkgId, onDragStart, onDragEnd, onReorder }) {
   if (!pkgs.length) return <div className="empty anim"><div className="icon">📦</div><h3>No Packages Yet</h3><p>点击右上角 "+ New Package" 创建第一个采购包</p></div>;
-  return <div className="grid anim">{pkgs.map((p) => <PkgCard key={p.id} pkg={p} logs={logs} onClick={() => onOpen(p.id)} />)}</div>;
+  return <div className="grid anim">{pkgs.map((p) => <PkgCard key={p.id} pkg={p} logs={logs} onClick={() => onOpen(p.id)} dragging={draggingPkgId === p.id} onDragStart={onDragStart} onDragEnd={onDragEnd} onReorder={onReorder} />)}</div>;
 }
 
-function PkgCard({ pkg, logs, onClick }) {
+function PkgCard({ pkg, logs, onClick, dragging, onDragStart, onDragEnd, onReorder }) {
   const done = pkg.nodes.filter((n) => n.status === "completed").length;
   const blocked = pkg.nodes.filter((n) => n.status === "blocked").length;
   const active = pkg.nodes.filter((n) => n.status !== "skipped").length;
@@ -369,9 +493,21 @@ function PkgCard({ pkg, logs, onClick }) {
   const barColor = blocked > 0 ? "var(--red)" : overdue ? "var(--amber)" : "var(--accent)";
   const tmpl = FLOW_TEMPLATES[pkg.flowTemplate];
   return (
-    <div className="card" onClick={onClick}>
-      <div className="card-head"><div><div className="card-id">{pkg.packageNo}</div><div className="card-name">{pkg.name}</div></div>
-        <div style={{ display: "flex", gap: 5, alignItems: "center" }}>{blocked > 0 && <span className="badge badge-red">⚠ {blocked} Blocked</span>}{overdue && !blocked && <span className="badge badge-amber">⏰ Overdue</span>}<span className="card-type">{pkg.type}</span></div></div>
+    <div className={`card ${dragging ? "dragging" : ""}`} onClick={onClick} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); e.stopPropagation(); onReorder(e.dataTransfer.getData("text/package-id"), pkg.id); onDragEnd(); }}>
+      <div className="card-top">
+        <button
+          className="drag-handle"
+          draggable
+          title="Drag to reorder package"
+          onClick={(e) => e.stopPropagation()}
+          onDragStart={(e) => { e.stopPropagation(); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/package-id", pkg.id); onDragStart(pkg.id); }}
+          onDragEnd={(e) => { e.stopPropagation(); onDragEnd(); }}
+        />
+        <div style={{ flex: 1 }}>
+          <div className="card-head"><div><div className="card-id">{pkg.packageNo}</div><div className="card-name">{pkg.name}</div></div>
+            <div style={{ display: "flex", gap: 5, alignItems: "center" }}>{blocked > 0 && <span className="badge badge-red">⚠ {blocked} Blocked</span>}{overdue && !blocked && <span className="badge badge-amber">⏰ Overdue</span>}<span className="card-type">{pkg.type}</span></div></div>
+        </div>
+      </div>
       <div className="progress"><div className="progress-bg"><div className="progress-fill" style={{ width: `${pct}%`, background: barColor }} /></div><div className="progress-info"><span>{pct}%</span><span>{done}/{active} nodes · {tmpl ? tmpl.labelCN : pkg.flowTemplate}</span></div></div>
       {cur && <div className="cur-node"><div className="cur-dot" style={{ background: STATUS_CONFIG[cur.status]?.dot }} /><div><div className="cur-label">{cur.id}: {cur.name}</div><div className="cur-cn">{cur.nameCN}</div></div></div>}
       <div className="card-foot"><span className="card-stat">Logs: <b>{pkgLogs.length}</b></span><span className="card-stat">Start: <b>{fmtDate(pkg.startDate)}</b></span></div>
@@ -380,7 +516,7 @@ function PkgCard({ pkg, logs, onClick }) {
 }
 
 // ─── Detail ───
-function Detail({ pkg, logs, attachments, logFilter, setLogFilter, onBack, onUpdNode, onAddLog, onDelLog, onDelPkg, onShowAddNode, onRemoveNode, onUploadAtt, onDelAtt, onPreview }) {
+function Detail({ pkg, logs, attachments, logFilter, setLogFilter, onBack, onUpdNode, onAddLog, onDelLog, onDelPkg, onShowAddNode, onRemoveNode, onUploadAtt, onDelAtt, onPreview, draggingNodeId, onNodeDragStart, onNodeDragEnd, onReorderNodes }) {
   return (
     <div className="anim">
       <div className="detail-head">
@@ -389,14 +525,14 @@ function Detail({ pkg, logs, attachments, logFilter, setLogFilter, onBack, onUpd
         <button className="btn btn-ghost btn-sm" onClick={onShowAddNode}>+ Add Node</button>
         <button className="btn btn-danger" onClick={onDelPkg}>Delete</button>
       </div>
-      <Timeline pkg={pkg} attachments={attachments} onUpd={onUpdNode} onRemoveNode={onRemoveNode} onUploadAtt={onUploadAtt} onDelAtt={onDelAtt} onPreview={onPreview} />
+      <Timeline pkg={pkg} attachments={attachments} onUpd={onUpdNode} onRemoveNode={onRemoveNode} onUploadAtt={onUploadAtt} onDelAtt={onDelAtt} onPreview={onPreview} draggingNodeId={draggingNodeId} onNodeDragStart={onNodeDragStart} onNodeDragEnd={onNodeDragEnd} onReorderNodes={onReorderNodes} />
       <div style={{ marginTop: 16 }}><LogPanel pkg={pkg} logs={logs} attachments={attachments} filter={logFilter} setFilter={setLogFilter} onAdd={onAddLog} onDel={onDelLog} onUploadAtt={onUploadAtt} onDelAtt={onDelAtt} onPreview={onPreview} /></div>
     </div>
   );
 }
 
 // ─── Timeline ───
-function Timeline({ pkg, attachments, onUpd, onRemoveNode, onUploadAtt, onDelAtt, onPreview }) {
+function Timeline({ pkg, attachments, onUpd, onRemoveNode, onUploadAtt, onDelAtt, onPreview, draggingNodeId, onNodeDragStart, onNodeDragEnd, onReorderNodes }) {
   const dates = pkg.nodes.flatMap((n) => [n.plannedStart, n.plannedEnd, n.actualStart, n.actualEnd].filter(Boolean));
   dates.push(todayStr());
   const min = new Date(Math.min(...dates.map((d) => +new Date(d))));
@@ -414,9 +550,9 @@ function Timeline({ pkg, attachments, onUpd, onRemoveNode, onUploadAtt, onDelAtt
         const sc = STATUS_CONFIG[n.status];
         const isOver = n.status === "in_progress" && n.plannedEnd && new Date(n.plannedEnd) < new Date(todayStr());
         return (
-          <div className="tl-row" key={n.id}>
+          <div className={`tl-row ${draggingNodeId === n.id ? "dragging" : ""}`} key={n.id} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); onReorderNodes(pkg.id, e.dataTransfer.getData("text/node-id"), n.id); onNodeDragEnd(); }}>
             <div className="tl-label">
-              <div style={{ display: "flex", alignItems: "center", gap: 4 }}><span className="tl-label-id">{n.id}</span>{n.isCustom && <span className="tl-label-custom">CUSTOM</span>}<button className="node-rm" onClick={() => onRemoveNode(n.id)} title="Remove">×</button></div>
+              <div className="tl-label-top"><button className="drag-handle" draggable title="Drag to reorder node" onDragStart={(e) => { e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/node-id", n.id); onNodeDragStart(n.id); }} onDragEnd={onNodeDragEnd} /><span className="tl-label-id">{n.id}</span>{n.isCustom && <span className="tl-label-custom">CUSTOM</span>}<button className="node-rm" onClick={() => onRemoveNode(n.id)} title="Remove">×</button></div>
               <div className="tl-label-name">{n.nameCN}</div>
             </div>
             <div className="tl-content">
